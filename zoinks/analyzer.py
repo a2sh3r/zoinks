@@ -1,4 +1,5 @@
 import ast
+from colorama import Fore, Style
 
 
 class ThreadSafetyAnalyzer(ast.NodeVisitor):
@@ -30,12 +31,17 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
                     self.shared_variables.add(var_name)
 
         if requires_lock and not self._uses_lock(node, requires_lock):
-            print(f"Warning: Function '{node.name}' requires lock '{requires_lock}' but does not use it.")
+            self._print_warning(
+                f"Function '{node.name}' requires lock '{requires_lock}' but does not use it.",
+                node
+            )
 
         for var in guarded_vars:
             if not self._guards_variable(node, var):
-                print(
-                    f"Warning: Function '{node.name}' is supposed to guard variable '{var}' but lacks necessary protection.")
+                self._print_warning(
+                    f"Function '{node.name}' is supposed to guard variable '{var}' but lacks necessary protection.",
+                    node
+                )
 
         self.generic_visit(node)
         self.current_function = None
@@ -72,7 +78,10 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
                 var_name = target.id
                 if var_name in self.shared_variables:
                     if self._is_locked():
-                        print(f"Warning: Shared variable '{var_name}' should not be used with a lock.")
+                        self._print_warning(
+                            f"Shared variable '{var_name}' should not be used with a lock.",
+                            node
+                        )
         self.generic_visit(node)
 
     def _is_locked(self):
@@ -88,3 +97,17 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
         self.parent_stack.append(node)
         super().generic_visit(node)
         self.parent_stack.pop()
+
+    def _print_warning(self, message, node):
+        """
+        Форматирует и выводит предупреждение с выделением
+        """
+        line = node.lineno
+        col_offset = node.col_offset
+        function_name = self.current_function or "Unknown"
+
+        print(
+            f"{Fore.YELLOW}Warning:{Style.RESET_ALL} {Fore.RESET} {message} "
+            f"{Fore.RESET}(Function:{Fore.YELLOW} {function_name}, {Fore.RESET}Line: {Fore.YELLOW}{line},{Fore.RESET} "
+            f"Column:{Fore.YELLOW} {col_offset}){Style.RESET_ALL}"
+        )
