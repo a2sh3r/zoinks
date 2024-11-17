@@ -1,0 +1,6 @@
+build/
+dist/
+tsa_zoinks.egg-info/
+.venv/
+.idea/
+zoinks.egg-info/
