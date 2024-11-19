@@ -1,24 +1,28 @@
 import threading
 from zoinks.macros import guards_variable, requires_lock
 
-# Lock for thread safety
 my_lock = threading.Lock()
+
 
 class SharedData:
     def __init__(self):
         self.shared_var = 0
 
     @requires_lock('my_lock')
+    def method_that_requires_lock(self):
+        print("This method requires a lock.")
+
+    @requires_lock('my_lock')
     @guards_variable('shared_var')
     def increment_shared_var(self):
         self.shared_var += 1
 
-# Instance of SharedData
+
 shared_data = SharedData()
 
-# Correct call with locking
 with my_lock:
-    shared_data.increment_shared_var()  # No warnings
+    shared_data.method_that_requires_lock()
+    shared_data.increment_shared_var()
 
-# Incorrect call without locking
+shared_data.method_that_requires_lock()  # Warning expected
 shared_data.increment_shared_var()  # Warning expected
