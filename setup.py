@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name='tsa-zoinks',
-    version='0.1.1',
+    version='0.1.2',
     packages=['zoinks'],
     entry_points={
         'console_scripts': [
@@ -16,7 +16,7 @@ setup(
     author='Zainutdinov Mikhail',
     author_email='michaelzainutdinov@ya.ru',
     classifiers=[
-        'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3'
         'License :: OSI Approved :: MIT License',
     ],
 )
