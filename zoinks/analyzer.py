@@ -1,113 +1,143 @@
 import ast
 from colorama import Fore, Style
 
-
 class ThreadSafetyAnalyzer(ast.NodeVisitor):
     def __init__(self):
         self.lock_annotations = {}
         self.variable_guards = {}
         self.shared_variables = set()
         self.current_function = None
-        self.parent_stack = []
+        self.locked_contexts = set()
+        self.current_class = None
 
     def visit_FunctionDef(self, node):
+        """
+        Save decorator annotations for functions.
+        """
+        previous_function = self.current_function
         self.current_function = node.name
-        requires_lock = None
-        guarded_vars = set()
 
         for decorator in node.decorator_list:
-            if isinstance(decorator, ast.Call):
+            if isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Name):
                 if decorator.func.id == 'requires_lock':
-                    requires_lock = decorator.args[0].s
-                    self.lock_annotations[node.name] = requires_lock
+                    lock_name = decorator.args[0].s
+                    self.lock_annotations[node.name] = lock_name
                 elif decorator.func.id == 'guards_variable':
-                    var_name = decorator.args[0].s
-                    guarded_vars.add(var_name)
-                    if node.name not in self.variable_guards:
-                        self.variable_guards[node.name] = set()
-                    self.variable_guards[node.name].add(var_name)
-                elif decorator.func.id == 'shared_variable':
-                    var_name = decorator.args[0].s
-                    self.shared_variables.add(var_name)
-
-        if requires_lock and not self._uses_lock(node, requires_lock):
-            self._print_warning(
-                f"Function '{node.name}' requires lock '{requires_lock}' but does not use it.",
-                node
-            )
-
-        for var in guarded_vars:
-            if not self._guards_variable(node, var):
-                self._print_warning(
-                    f"Function '{node.name}' is supposed to guard variable '{var}' but lacks necessary protection.",
-                    node
-                )
+                    variable_name = decorator.args[0].s
+                    self.variable_guards[node.name] = variable_name
+                    self.shared_variables.add(variable_name)
 
         self.generic_visit(node)
-        self.current_function = None
+        self.current_function = previous_function
 
-    def _uses_lock(self, node, lock_name):
+    def visit_ClassDef(self, node):
         """
-        Проверяет, используется ли заданная блокировка внутри `with lock_name`.
+        Handle class definitions.
         """
-        for child in ast.walk(node):
-            if isinstance(child, ast.With):
-                for item in child.items:
-                    if isinstance(item.context_expr, ast.Name) and item.context_expr.id == lock_name:
-                        return True
-        return False
+        previous_class = self.current_class
+        self.current_class = node.name
+        self.generic_visit(node)
+        self.current_class = previous_class
 
-    def _guards_variable(self, node, var_name):
+    def visit_With(self, node):
         """
-        Проверяет, что переменная `var_name` защищена внутри функции.
+        Handle with lock blocks.
         """
-        for child in ast.walk(node):
-            if isinstance(child, ast.Assign):
-                for target in child.targets:
-                    if isinstance(target, ast.Name) and target.id == var_name:
-                        if not self._uses_lock(node, self.lock_annotations.get(node.name, None)):
-                            return False
-        return True
+        for item in node.items:
+            if isinstance(item.context_expr, ast.Name):
+                self.locked_contexts.add(item.context_expr.id)
 
-    def visit_Assign(self, node):
+        self.generic_visit(node)
+
+        for item in node.items:
+            if isinstance(item.context_expr, ast.Name):
+                self.locked_contexts.discard(item.context_expr.id)
+
+    def visit_Call(self, node):
         """
-        Проверка использования @shared_variable
+        Check function calls considering @requires_lock decorators.
         """
-        for target in node.targets:
-            if isinstance(target, ast.Name):
-                var_name = target.id
-                if var_name in self.shared_variables:
-                    if self._is_locked():
+        if isinstance(node.func, ast.Attribute):
+            if isinstance(node.func.value, ast.Attribute):
+                class_name = node.func.value.value.id
+                method_name = node.func.attr
+                if class_name == self.current_class and method_name in self.lock_annotations:
+                    required_lock = self.lock_annotations[method_name]
+                    if required_lock not in self.locked_contexts:
                         self._print_warning(
-                            f"Shared variable '{var_name}' should not be used with a lock.",
+                            f"Method '{method_name}' of class '{class_name}' requires lock '{required_lock}' but is called without it.",
                             node
                         )
+            elif isinstance(node.func.value, ast.Name):
+                func_name = node.func.attr
+                if func_name in self.lock_annotations:
+                    required_lock = self.lock_annotations[func_name]
+                    if required_lock not in self.locked_contexts:
+                        self._print_warning(
+                            f"Function '{func_name}' requires lock '{required_lock}' but is called without it.",
+                            node
+                        )
+        elif isinstance(node.func, ast.Name):
+            func_name = node.func.id
+            if func_name in self.lock_annotations:
+                required_lock = self.lock_annotations[func_name]
+                if required_lock not in self.locked_contexts:
+                    self._print_warning(
+                        f"Function '{func_name}' requires lock '{required_lock}' but is called without it.",
+                        node
+                    )
+
         self.generic_visit(node)
 
-    def _is_locked(self):
+    def visit_Name(self, node):
         """
-        Проверяет, находится ли текущий узел внутри `with` блока.
+        Check access to variables considering @guards_variable decorators.
         """
-        return any(isinstance(parent, ast.With) for parent in self.parent_stack)
+        if isinstance(node.ctx, ast.Load) and node.id in self.shared_variables:
+            if self.current_function in self.variable_guards:
+                guarded_by = self.lock_annotations.get(self.current_function)
+                if guarded_by not in self.locked_contexts:
+                    if self.current_class:
+                        self._print_warning(
+                            f"Access to shared variable '{node.id}' in method '{self.current_function}' "
+                            f"of class '{self.current_class}' is not protected by lock '{guarded_by}'.",
+                            node
+                        )
+                    else:
+                        self._print_warning(
+                            f"Access to shared variable '{node.id}' in function '{self.current_function}' "
+                            f"is not protected by lock '{guarded_by}'.",
+                            node
+                        )
 
-    def generic_visit(self, node):
+    def visit_Expr(self, node):
         """
-        Переопределяем generic_visit для отслеживания родительских узлов
+        Handle lock.acquire() and lock.release() calls.
         """
-        self.parent_stack.append(node)
-        super().generic_visit(node)
-        self.parent_stack.pop()
+        if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute):
+            attr = node.value.func
+            if isinstance(attr.value, ast.Name):
+                if attr.attr == 'acquire':
+                    self.locked_contexts.add(attr.value.id)
+                elif attr.attr == 'release':
+                    self.locked_contexts.discard(attr.value.id)
+
+        self.generic_visit(node)
 
     def _print_warning(self, message, node):
         """
-        Форматирует и выводит предупреждение с выделением
+        Format and print warnings.
         """
         line = node.lineno
         col_offset = node.col_offset
-        function_name = self.current_function or "Unknown"
 
         print(
-            f"{Fore.YELLOW}Warning:{Style.RESET_ALL} {Fore.RESET} {message} "
-            f"{Fore.RESET}(Function:{Fore.YELLOW} {function_name}, {Fore.RESET}Line: {Fore.YELLOW}{line},{Fore.RESET} "
-            f"Column:{Fore.YELLOW} {col_offset}){Style.RESET_ALL}"
+            f"{Fore.YELLOW}Warning:{Style.RESET_ALL} {message} "
+            f"{Fore.RESET}(Line: {Fore.YELLOW}{line}, Column: {col_offset}{Fore.RESET})"
         )
+
+    def generic_visit(self, node):
+        """
+        General processing of nodes while tracking parent contexts.
+        """
+        super().generic_visit(node)

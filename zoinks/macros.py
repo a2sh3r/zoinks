@@ -29,6 +29,7 @@ def guards_variable(var_name):
     return decorator
 
 
+# TODO: Working on
 def shared_variable(var_name):
     def decorator(func):
         if not hasattr(func, '_shared_variables'):
