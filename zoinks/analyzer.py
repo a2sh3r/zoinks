@@ -1,6 +1,7 @@
 import ast
 from colorama import Fore, Style
 
+
 class ThreadSafetyAnalyzer(ast.NodeVisitor):
     def __init__(self):
         self.lock_annotations = {}
@@ -9,40 +10,37 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
         self.current_function = None
         self.locked_contexts = set()
         self.current_class = None
+        self.warnings = []
 
     def visit_FunctionDef(self, node):
-        """
-        Save decorator annotations for functions.
-        """
         previous_function = self.current_function
         self.current_function = node.name
+
+        required_lock = None
 
         for decorator in node.decorator_list:
             if isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Name):
                 if decorator.func.id == 'requires_lock':
-                    lock_name = decorator.args[0].s
-                    self.lock_annotations[node.name] = lock_name
+                    required_lock = decorator.args[0].s
+                    self.lock_annotations[node.name] = required_lock
                 elif decorator.func.id == 'guards_variable':
                     variable_name = decorator.args[0].s
-                    self.variable_guards[node.name] = variable_name
+                    self.variable_guards[node.name] = {
+                        "var": variable_name,
+                        "lock": required_lock
+                    }
                     self.shared_variables.add(variable_name)
 
         self.generic_visit(node)
         self.current_function = previous_function
 
     def visit_ClassDef(self, node):
-        """
-        Handle class definitions.
-        """
         previous_class = self.current_class
         self.current_class = node.name
         self.generic_visit(node)
         self.current_class = previous_class
 
     def visit_With(self, node):
-        """
-        Handle with lock blocks.
-        """
         for item in node.items:
             if isinstance(item.context_expr, ast.Name):
                 self.locked_contexts.add(item.context_expr.id)
@@ -54,9 +52,6 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
                 self.locked_contexts.discard(item.context_expr.id)
 
     def visit_Call(self, node):
-        """
-        Check function calls considering @requires_lock decorators.
-        """
         if isinstance(node.func, ast.Attribute):
             if isinstance(node.func.value, ast.Attribute):
                 class_name = node.func.value.value.id
@@ -64,7 +59,7 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
                 if class_name == self.current_class and method_name in self.lock_annotations:
                     required_lock = self.lock_annotations[method_name]
                     if required_lock not in self.locked_contexts:
-                        self._print_warning(
+                        self._add_warning(
                             f"Method '{method_name}' of class '{class_name}' requires lock '{required_lock}' but is called without it.",
                             node
                         )
@@ -73,7 +68,7 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
                 if func_name in self.lock_annotations:
                     required_lock = self.lock_annotations[func_name]
                     if required_lock not in self.locked_contexts:
-                        self._print_warning(
+                        self._add_warning(
                             f"Function '{func_name}' requires lock '{required_lock}' but is called without it.",
                             node
                         )
@@ -82,38 +77,37 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
             if func_name in self.lock_annotations:
                 required_lock = self.lock_annotations[func_name]
                 if required_lock not in self.locked_contexts:
-                    self._print_warning(
+                    self._add_warning(
                         f"Function '{func_name}' requires lock '{required_lock}' but is called without it.",
                         node
                     )
 
         self.generic_visit(node)
 
-    def visit_Name(self, node):
-        """
-        Check access to variables considering @guards_variable decorators.
-        """
-        if isinstance(node.ctx, ast.Load) and node.id in self.shared_variables:
-            if self.current_function in self.variable_guards:
-                guarded_by = self.lock_annotations.get(self.current_function)
-                if guarded_by not in self.locked_contexts:
-                    if self.current_class:
-                        self._print_warning(
-                            f"Access to shared variable '{node.id}' in method '{self.current_function}' "
-                            f"of class '{self.current_class}' is not protected by lock '{guarded_by}'.",
-                            node
-                        )
-                    else:
-                        self._print_warning(
-                            f"Access to shared variable '{node.id}' in function '{self.current_function}' "
-                            f"is not protected by lock '{guarded_by}'.",
-                            node
-                        )
+    def visit_Attribute(self, node):
+        if isinstance(node.ctx, (ast.Load, ast.Store)) and isinstance(node.value, ast.Name):
+            if node.attr in self.shared_variables:
+                if self.current_function in self.variable_guards:
+                    guard_info = self.variable_guards[self.current_function]
+                    guarded_var = guard_info["var"]
+                    lock_name = guard_info["lock"]
+
+                    if node.attr == guarded_var and lock_name not in self.locked_contexts:
+                        if self.current_class:
+                            self._add_warning(
+                                f"Access to guarded variable '{node.attr}' in method '{self.current_function}' of class '{self.current_class}' "
+                                f"is not protected by lock '{lock_name}'.",
+                                node
+                            )
+                        else:
+                            self._add_warning(
+                                f"Access to guarded variable '{node.attr}' in function '{self.current_function}' "
+                                f"is not protected by lock '{lock_name}'.",
+                                node
+                            )
+        self.generic_visit(node)
 
     def visit_Expr(self, node):
-        """
-        Handle lock.acquire() and lock.release() calls.
-        """
         if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute):
             attr = node.value.func
             if isinstance(attr.value, ast.Name):
@@ -124,20 +118,33 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
 
         self.generic_visit(node)
 
-    def _print_warning(self, message, node):
-        """
-        Format and print warnings.
-        """
+    def _add_warning(self, message, node):
         line = node.lineno
         col_offset = node.col_offset
-
-        print(
-            f"{Fore.YELLOW}Warning:{Style.RESET_ALL} {message} "
-            f"{Fore.RESET}(Line: {Fore.YELLOW}{line}, Column: {col_offset}{Fore.RESET})"
-        )
+        self.warnings.append((message, line, col_offset))
 
     def generic_visit(self, node):
-        """
-        General processing of nodes while tracking parent contexts.
-        """
         super().generic_visit(node)
+
+
+def analyze_file(filename):
+    analyzer = ThreadSafetyAnalyzer()
+    try:
+        with open(filename, "r") as source:
+            tree = ast.parse(source.read(), filename=filename)
+        analyzer.visit(tree)
+
+        warnings_found = bool(analyzer.warnings)
+        print(f"\n{Fore.RED if warnings_found else Fore.GREEN}=== Analyzing: {filename} ==={Style.RESET_ALL}")
+
+        if warnings_found:
+            for warning, line, col in analyzer.warnings:
+                print(f"{Fore.RED}Warning:{Style.RESET_ALL} {warning} "
+                      f"{Fore.RESET}(Line: {Fore.YELLOW}{line}, Column: {col}{Fore.RESET})")
+        else:
+            print(f"{Fore.GREEN}Warnings not found")
+
+    except FileNotFoundError:
+        print(f"Error: File '{filename}' not found.")
+    except SyntaxError as e:
+        print(f"Error: Syntax error in file '{filename}': {e}")
