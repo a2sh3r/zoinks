@@ -1,5 +1,10 @@
 import ast
+import sysconfig
 from colorama import Fore, Style
+
+
+def check_gil():
+    return bool(sysconfig.get_config_var('Py_GIL_DISABLED')==1)
 
 
 class ThreadSafetyAnalyzer(ast.NodeVisitor):
@@ -119,8 +124,8 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
         self.generic_visit(node)
 
     def _add_warning(self, message, node):
-        line = node.lineno
-        col_offset = node.col_offset
+        line = node.lineno if node else "Unknown"
+        col_offset = node.col_offset if node else "Unknown"
         self.warnings.append((message, line, col_offset))
 
     def generic_visit(self, node):
@@ -129,6 +134,7 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
 
 def analyze_file(filename):
     analyzer = ThreadSafetyAnalyzer()
+
     try:
         with open(filename, "r") as source:
             tree = ast.parse(source.read(), filename=filename)
