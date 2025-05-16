@@ -20,6 +20,11 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
         self.locked_contexts = set()
         self.current_class = None
         self.warnings = []
+        self.lock_acquisition_sequences = {}
+        self.current_lock_sequence = []
+        self.locked_multiple_times = {}
+        self.lock_acquire_counts = {}
+        self.lock_release_counts = {}
 
     def visit_FunctionDef(self, node):
         previous_function = self.current_function
@@ -42,6 +47,23 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
         self.generic_visit(node)
 
         self.lock_acquisition_sequences[self.current_function] = list(self.current_lock_sequence)
+
+        for lock in set(self.lock_acquire_counts.keys()) | set(self.lock_release_counts.keys()):
+            acquired = self.lock_acquire_counts.get(lock, 0)
+            released = self.lock_release_counts.get(lock, 0)
+
+            if acquired != released:
+                self._add_warning(
+                    f"Mismatch between .acquire() and .release() calls for '{lock}': "
+                    f"{acquired} acquires but {released} releases in function '{node.name}'.",
+                    node
+                )
+
+        self.lock_acquire_counts.clear()
+        self.lock_release_counts.clear()
+
+        self.current_function = previous_function
+
         self.current_function = previous_function
 
     def visit_ClassDef(self, node):
@@ -53,13 +75,16 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
     def visit_With(self, node):
         for item in node.items:
             if isinstance(item.context_expr, ast.Name):
-                self.locked_contexts.add(item.context_expr.id)
+                lock_name = item.context_expr.id
+                self.locked_contexts.add(lock_name)
+                self.current_lock_sequence.append(lock_name)
 
         self.generic_visit(node)
 
         for item in node.items:
             if isinstance(item.context_expr, ast.Name):
-                self.locked_contexts.discard(item.context_expr.id)
+                lock_name = item.context_expr.id
+                self.locked_contexts.discard(lock_name)
 
     def visit_Call(self, node):
         if isinstance(node.func, ast.Attribute):
@@ -122,10 +147,19 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
             attr = node.value.func
             if isinstance(attr.value, ast.Name):
                 lock_name = attr.value.id
+
                 if attr.attr == 'acquire':
+                    self.lock_acquire_counts[lock_name] = self.lock_acquire_counts.get(lock_name, 0) + 1
+                    if lock_name in self.locked_contexts:
+                        self._add_warning(
+                            f"Potential self-deadlock: '{lock_name}' is a regular Lock and is already held by the same thread.",
+                            node
+                        )
                     self.locked_contexts.add(lock_name)
                     self.current_lock_sequence.append(lock_name)
+
                 elif attr.attr == 'release':
+                    self.lock_release_counts[lock_name] = self.lock_release_counts.get(lock_name, 0) + 1
                     if lock_name in self.locked_contexts:
                         self.locked_contexts.remove(lock_name)
 
