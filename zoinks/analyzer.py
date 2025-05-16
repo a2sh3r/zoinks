@@ -1,10 +1,14 @@
 import ast
 import sysconfig
+import os
+import sys
+from itertools import combinations
 from colorama import Fore, Style
+import functools
 
 
 def check_gil():
-    return bool(sysconfig.get_config_var('Py_GIL_DISABLED')==1)
+    return bool(sysconfig.get_config_var('Py_GIL_DISABLED') == 1)
 
 
 class ThreadSafetyAnalyzer(ast.NodeVisitor):
@@ -20,8 +24,7 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
     def visit_FunctionDef(self, node):
         previous_function = self.current_function
         self.current_function = node.name
-
-        required_lock = None
+        self.current_lock_sequence = []
 
         for decorator in node.decorator_list:
             if isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Name):
@@ -32,11 +35,13 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
                     variable_name = decorator.args[0].s
                     self.variable_guards[node.name] = {
                         "var": variable_name,
-                        "lock": required_lock
+                        "lock": self.lock_annotations.get(node.name)
                     }
                     self.shared_variables.add(variable_name)
 
         self.generic_visit(node)
+
+        self.lock_acquisition_sequences[self.current_function] = list(self.current_lock_sequence)
         self.current_function = previous_function
 
     def visit_ClassDef(self, node):
@@ -116,12 +121,38 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
         if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute):
             attr = node.value.func
             if isinstance(attr.value, ast.Name):
+                lock_name = attr.value.id
                 if attr.attr == 'acquire':
-                    self.locked_contexts.add(attr.value.id)
+                    self.locked_contexts.add(lock_name)
+                    self.current_lock_sequence.append(lock_name)
                 elif attr.attr == 'release':
-                    self.locked_contexts.discard(attr.value.id)
+                    if lock_name in self.locked_contexts:
+                        self.locked_contexts.remove(lock_name)
 
         self.generic_visit(node)
+
+    def detect_deadlocks(self):
+        sequences = self.lock_acquisition_sequences
+
+        for (func1, seq1), (func2, seq2) in combinations(sequences.items(), 2):
+            if not seq1 or not seq2:
+                continue
+
+            pos1 = {lock: idx for idx, lock in enumerate(seq1)}
+            pos2 = {lock: idx for idx, lock in enumerate(seq2)}
+
+            for lock_a in set(seq1) & set(seq2):
+                for lock_b in set(seq1) & set(seq2):
+                    if lock_a == lock_b:
+                        continue
+                    if lock_a in pos1 and lock_b in pos1 and lock_a in pos2 and lock_b in pos2:
+                        if (pos1[lock_a] < pos1[lock_b]) and (pos2[lock_a] > pos2[lock_b]):
+                            self._add_warning(
+                                f"Potential deadlock detected: inconsistent lock acquisition order "
+                                f"for '{lock_a}' and '{lock_b}' between functions '{func1}' and '{func2}'.",
+                                None
+                            )
+                            break
 
     def _add_warning(self, message, node):
         line = node.lineno if node else "Unknown"
@@ -139,6 +170,7 @@ def analyze_file(filename):
         with open(filename, "r") as source:
             tree = ast.parse(source.read(), filename=filename)
         analyzer.visit(tree)
+        analyzer.detect_deadlocks()
 
         warnings_found = bool(analyzer.warnings)
         print(f"\n{Fore.RED if warnings_found else Fore.GREEN}=== Analyzing: {filename} ==={Style.RESET_ALL}")
@@ -148,7 +180,7 @@ def analyze_file(filename):
                 print(f"{Fore.RED}Warning:{Style.RESET_ALL} {warning} "
                       f"{Fore.RESET}(Line: {Fore.YELLOW}{line}, Column: {col}{Fore.RESET})")
         else:
-            print(f"{Fore.GREEN}Warnings not found")
+            print(f"{Fore.GREEN}Warnings not found{Style.RESET_ALL}")
 
     except FileNotFoundError:
         print(f"Error: File '{filename}' not found.")
