@@ -25,24 +25,37 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
         self.locked_multiple_times = {}
         self.lock_acquire_counts = {}
         self.lock_release_counts = {}
+        self.current_class = None
+        self.class_locks = {}
+        self.class_methods = {}
 
     def visit_FunctionDef(self, node):
         previous_function = self.current_function
         self.current_function = node.name
-        self.current_lock_sequence = []
+
+        if self.current_class:
+            self.class_methods[self.current_class].append(node.name)
+
+        required_locks = []
+        guarded_vars = []
 
         for decorator in node.decorator_list:
             if isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Name):
                 if decorator.func.id == 'requires_lock':
-                    required_lock = decorator.args[0].s
-                    self.lock_annotations[node.name] = required_lock
+                    lock = decorator.args[0].s
+                    required_locks.append(lock)
+                    self.lock_annotations[
+                        f"{self.current_class}.{node.name}" if self.current_class else node.name] = lock
+                    if self.current_class:
+                        self.class_locks[self.current_class].add(lock)
                 elif decorator.func.id == 'guards_variable':
-                    variable_name = decorator.args[0].s
+                    var = decorator.args[0].s
+                    guarded_vars.append(var)
                     self.variable_guards[node.name] = {
-                        "var": variable_name,
-                        "lock": self.lock_annotations.get(node.name)
+                        "var": var,
+                        "lock": required_locks[-1] if required_locks else None
                     }
-                    self.shared_variables.add(variable_name)
+                    self.shared_variables.add(var)
 
         self.generic_visit(node)
 
@@ -69,6 +82,9 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
     def visit_ClassDef(self, node):
         previous_class = self.current_class
         self.current_class = node.name
+        self.class_methods[self.current_class] = []
+        self.class_locks[self.current_class] = set()
+
         self.generic_visit(node)
         self.current_class = previous_class
 
@@ -88,14 +104,16 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
 
     def visit_Call(self, node):
         if isinstance(node.func, ast.Attribute):
-            if isinstance(node.func.value, ast.Attribute):
-                class_name = node.func.value.value.id
+            if isinstance(node.func.value, ast.Name):
                 method_name = node.func.attr
-                if class_name == self.current_class and method_name in self.lock_annotations:
-                    required_lock = self.lock_annotations[method_name]
+                class_name = node.func.value.id
+                full_name = f"{class_name}.{method_name}"
+
+                if full_name in self.lock_annotations:
+                    required_lock = self.lock_annotations[full_name]
                     if required_lock not in self.locked_contexts:
                         self._add_warning(
-                            f"Method '{method_name}' of class '{class_name}' requires lock '{required_lock}' but is called without it.",
+                            f"Method '{method_name}' of class '{class_name}' requires lock '{required_lock}', but is called without it.",
                             node
                         )
             elif isinstance(node.func.value, ast.Name):

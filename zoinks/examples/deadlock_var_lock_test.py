@@ -33,6 +33,5 @@ t2.start()
 
 
 start_event.set()
-йййййй
 t1.join()
 t2.join()

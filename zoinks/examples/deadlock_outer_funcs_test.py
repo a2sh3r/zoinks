@@ -1,8 +1,6 @@
 import threading
 import time
 
-from zoinks.macros import requires_lock
-
 lock_a = threading.Lock()
 lock_b = threading.Lock()
 
