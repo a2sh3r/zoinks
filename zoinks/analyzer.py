@@ -20,57 +20,100 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
         self.locked_contexts = set()
         self.current_class = None
         self.warnings = []
+        self.lock_acquisition_sequences = {}
+        self.current_lock_sequence = []
+        self.locked_multiple_times = {}
+        self.lock_acquire_counts = {}
+        self.lock_release_counts = {}
+        self.current_class = None
+        self.class_locks = {}
+        self.class_methods = {}
 
     def visit_FunctionDef(self, node):
         previous_function = self.current_function
         self.current_function = node.name
-        self.current_lock_sequence = []
+
+        if self.current_class:
+            self.class_methods[self.current_class].append(node.name)
+
+        required_locks = []
+        guarded_vars = []
 
         for decorator in node.decorator_list:
             if isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Name):
                 if decorator.func.id == 'requires_lock':
-                    required_lock = decorator.args[0].s
-                    self.lock_annotations[node.name] = required_lock
+                    lock = decorator.args[0].s
+                    required_locks.append(lock)
+                    self.lock_annotations[
+                        f"{self.current_class}.{node.name}" if self.current_class else node.name] = lock
+                    if self.current_class:
+                        self.class_locks[self.current_class].add(lock)
                 elif decorator.func.id == 'guards_variable':
-                    variable_name = decorator.args[0].s
+                    var = decorator.args[0].s
+                    guarded_vars.append(var)
                     self.variable_guards[node.name] = {
-                        "var": variable_name,
-                        "lock": self.lock_annotations.get(node.name)
+                        "var": var,
+                        "lock": required_locks[-1] if required_locks else None
                     }
-                    self.shared_variables.add(variable_name)
+                    self.shared_variables.add(var)
 
         self.generic_visit(node)
 
         self.lock_acquisition_sequences[self.current_function] = list(self.current_lock_sequence)
+
+        for lock in set(self.lock_acquire_counts.keys()) | set(self.lock_release_counts.keys()):
+            acquired = self.lock_acquire_counts.get(lock, 0)
+            released = self.lock_release_counts.get(lock, 0)
+
+            if acquired != released:
+                self._add_warning(
+                    f"Mismatch between .acquire() and .release() calls for '{lock}': "
+                    f"{acquired} acquires but {released} releases in function '{node.name}'.",
+                    node
+                )
+
+        self.lock_acquire_counts.clear()
+        self.lock_release_counts.clear()
+
+        self.current_function = previous_function
+
         self.current_function = previous_function
 
     def visit_ClassDef(self, node):
         previous_class = self.current_class
         self.current_class = node.name
+        self.class_methods[self.current_class] = []
+        self.class_locks[self.current_class] = set()
+
         self.generic_visit(node)
         self.current_class = previous_class
 
     def visit_With(self, node):
         for item in node.items:
             if isinstance(item.context_expr, ast.Name):
-                self.locked_contexts.add(item.context_expr.id)
+                lock_name = item.context_expr.id
+                self.locked_contexts.add(lock_name)
+                self.current_lock_sequence.append(lock_name)
 
         self.generic_visit(node)
 
         for item in node.items:
             if isinstance(item.context_expr, ast.Name):
-                self.locked_contexts.discard(item.context_expr.id)
+                lock_name = item.context_expr.id
+                self.locked_contexts.discard(lock_name)
 
     def visit_Call(self, node):
         if isinstance(node.func, ast.Attribute):
-            if isinstance(node.func.value, ast.Attribute):
-                class_name = node.func.value.value.id
+            if isinstance(node.func.value, ast.Name):
                 method_name = node.func.attr
-                if class_name == self.current_class and method_name in self.lock_annotations:
-                    required_lock = self.lock_annotations[method_name]
+                class_name = node.func.value.id
+                full_name = f"{class_name}.{method_name}"
+
+                if full_name in self.lock_annotations:
+                    required_lock = self.lock_annotations[full_name]
                     if required_lock not in self.locked_contexts:
                         self._add_warning(
-                            f"Method '{method_name}' of class '{class_name}' requires lock '{required_lock}' but is called without it.",
+                            f"Method '{method_name}' of class '{class_name}' requires lock '{required_lock}', but is called without it.",
                             node
                         )
             elif isinstance(node.func.value, ast.Name):
@@ -122,10 +165,19 @@ class ThreadSafetyAnalyzer(ast.NodeVisitor):
             attr = node.value.func
             if isinstance(attr.value, ast.Name):
                 lock_name = attr.value.id
+
                 if attr.attr == 'acquire':
+                    self.lock_acquire_counts[lock_name] = self.lock_acquire_counts.get(lock_name, 0) + 1
+                    if lock_name in self.locked_contexts:
+                        self._add_warning(
+                            f"Potential self-deadlock: '{lock_name}' is a regular Lock and is already held by the same thread.",
+                            node
+                        )
                     self.locked_contexts.add(lock_name)
                     self.current_lock_sequence.append(lock_name)
+
                 elif attr.attr == 'release':
+                    self.lock_release_counts[lock_name] = self.lock_release_counts.get(lock_name, 0) + 1
                     if lock_name in self.locked_contexts:
                         self.locked_contexts.remove(lock_name)
 
